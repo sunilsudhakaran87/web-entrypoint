@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--suppress SpringFacetInspection -->
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:camel="http://camel.apache.org/schema/spring"
+       xsi:schemaLocation="
+       http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+       http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd">
+
+
+
+    <bean id="priceAggregator" class="org.sanjay.webentrypoint.aggregator.FlightResponseAggregationStrategy"/>
+
+    <bean id="customConverter" class="org.sanjay.webentrypoint.utils.CustomConverter"/>
+
+    <bean id="authUtils" class="org.sanjay.webentrypoint.utils.AuthenticationUtils"/>
+
+    <bean id="restUtils" class="org.sanjay.webentrypoint.utils.RestUtils"/>
+
+    <!--
+    <bean id="gcpConnectionFactory" class="org.apache.camel.component.google.pubsub.GooglePubsubConnectionFactory">
+        <property name="serviceAccount" value="pub-sub-editor@crypto-haven-217910.iam.gserviceaccount.com"/>
+        <property name="serviceAccountKey" value="${gcp.key}"/>
+    </bean>
+    -->
+
+
+
+    <!-- You could also define a traditional camel context here -->
+    <camelContext id="camel" xmlns="http://camel.apache.org/schema/spring">
+        <dataFormats>
+            <json library="Jackson" id="jackson" unmarshalTypeName="org.sanjay.webentrypoint.model.BookingResponse"/>
+        </dataFormats>
+
+
+        <onException>
+            <exception>java.lang.Exception</exception>
+            <handled>
+                <constant>true</constant>
+            </handled>
+
+            <setHeader headerName="CamelHttpResponseCode">
+                <constant>500</constant>
+            </setHeader>
+
+            <setHeader headerName="Content-Type">
+                <constant>application/json</constant>
+            </setHeader>
+
+            <setHeader headerName="exceptionMessage">
+                <simple resultType="java.lang.String">${exception}</simple>
+            </setHeader>
+
+            <setBody>
+                <groovy>
+                    import org.sanjay.webentrypoint.exception.CamelApplicationException
+                    def ex = new CamelApplicationException(request.getHeader('exceptionMessage'))
+                    return ex
+                </groovy>
+            </setBody>
+        </onException>
+
+        <route streamCache="true">
+            <from uri="direct:doBooking"/>
+            <!--<marshal ref="jackson"/>-->
+            <log message="Inside main body, type is: ${body.class.name}"/>
+
+            <bean ref="restUtils" method="doPost({{flight-search.service.url}}, ${body})"/>
+            <!--<to uri="http4://localhost:8081/api/flight"/>-->
+
+            <log message="Body after call is ${body}"/>
+
+
+
+            <split strategyRef="priceAggregator">
+                <!--<jsonpath>$</jsonpath>-->
+                <simple>${body}</simple>
+                <bean ref="customConverter" method="convertFromMapToPojo"/>
+                <log message="Body inside split: ${body}"/>
+                <log message="Body type inside split: ${body.class.name}"/>
+            </split>
+
+
+            <log message="Body after aggregation is ${body}"/>
+
+            <setHeader headerName="flightId">
+                <simple>${body.flightId}</simple>
+            </setHeader>
+            <setHeader headerName="userName">
+                <simple>bean:authUtils?method=getLoggedInUserName</simple>
+            </setHeader>
+
+            <log message="Username is ${headers.userName}"/>
+            <to uri="sql:SELECT customer_id FROM customer where login = :#userName?outputType=SelectOne&amp;dataSource=#dataSource"/>
+
+            <setHeader headerName="customerId">
+                <simple>${body}</simple>
+            </setHeader>
+
+            <setBody>
+                <groovy>
+                    /*
+                    import groovy.json.JsonBuilder
+                    import groovy.json.JsonOutput
+
+                    JsonBuilder builder = new JsonBuilder()
+
+                    def flightIdValue = request.getHeader('flightId')
+                    def customerIdValue = request.getHeader('customerId')
+
+                    builder {
+                        flightId flightIdValue
+                        customerId customerIdValue
+                    }
+
+                    return JsonOutput.prettyPrint(builder.toString())
+                    */
+                    import org.sanjay.webentrypoint.model.BookingRequest
+
+                    def flightIdValue = request.getHeader('flightId')
+                    def customerIdValue = request.getHeader('customerId')
+
+                    def request = new BookingRequest()
+                    request.setCustomerId(customerIdValue)
+                    request.setFlightId(flightIdValue)
+
+                    return request
+                </groovy>
+            </setBody>
+
+            <log message="Request body type  is ${body.class.name}"/>
+            <!--<to uri="google-pubsub:{{spring.cloud.gcp.project-id}}:{{spring.cloud.gcp.topic.name}}?connectionFactory=#gcpConnectionFactory"/>
+            <log message="Sent data to google pub sub topic"/>
+            <pollEnrich>
+                <constant>google-pubsub:crypto-haven-217910:demo-response-subscription?connectionFactory=#gcpConnectionFactory</constant>
+            </pollEnrich> -->
+            <!--
+            <recipientList>
+                <simple>google-pubsub:${properties-location:spring.cloud.gcp.project-id}:demo-response-subscription?connectionFactory=#gcpConnectionFactory</simple>
+            </recipientList>
+            -->
+            <hystrix>
+                <bean ref="restUtils" method="doPost({{flight-booking.service.url}}, ${body})"/>
+                <onFallback>
+                    <to uri="direct:fakeBooking"/>
+                </onFallback>
+            </hystrix>
+
+            <setBody>
+                <groovy>
+                    import org.codehaus.jackson.map.ObjectMapper
+                    import org.sanjay.webentrypoint.model.BookingResponse
+
+                    def body = request.body
+                    return new ObjectMapper().convertValue(body, BookingResponse.class)
+                </groovy>
+            </setBody>
+
+            <!--<to uri="http4://localhost:8082/api/booking"/>-->
+
+            <log message="Response type from booking service: ${body.class.name}"/>
+        </route>
+
+        <route id="fakeBookingRoute">
+            <from uri="direct:fakeBooking"/>
+            <setBody>
+                <groovy>
+                    def map = [:]
+                    map.put('bookingId', 7777)
+                    map.put('customerName', 'ServiceNotAvailable.FakeCustomer')
+                    map.put('airline', 'ServiceNotAvailable.FakeAirline')
+                    map.put('departure', 'ServiceNotAvailable.FakeStartCity')
+                    map.put('destination', 'ServiceNotAvailable.FakeEndCity')
+                    map.put('departureDate', new Date())
+                    map.put('flightClass', 'ServiceNotAvailable.FakeFlightClass')
+                    map.put('price', 7777)
+
+                    return map
+                </groovy>
+            </setBody>
+        </route>
+    </camelContext>
+
+</beans>
